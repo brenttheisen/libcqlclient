@@ -1,0 +1,3 @@
+A C library for integrating with the Cassandra CQL binary protocol...
+
+https://git-wip-us.apache.org/repos/asf?p=cassandra.git;a=blob_plain;f=doc/native_protocol.spec;hb=refs/heads/cassandra-1.2
