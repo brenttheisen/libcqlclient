@@ -1,0 +1,20 @@
+.*.sw?
+autom4te.cache
+src/cqltest-cql.o src/cqltest-main.o
+Makefile
+Makefile.in
+src/Makefile
+src/Makefile.in
+src/*.o
+src/cqltest
+
+config.log
+config.h
+config.h.in
+config.status
+configure
+config.guess
+aclocal.m4
+.deps
+config.h.in config.h.in~
+config.h.in~
