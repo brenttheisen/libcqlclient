@@ -6,7 +6,7 @@ Makefile.in
 src/Makefile
 src/Makefile.in
 src/*.o
-src/cqltest
+src/cql
 
 config.log
 config.h
@@ -18,3 +18,19 @@ aclocal.m4
 .deps
 config.h.in config.h.in~
 config.h.in~
+config.sub
+libcqlclient-0.0.pc
+libtool
+src/.libs/
+src/cql.lo
+src/libcqlclient.la
+src/libcqldriver.la
+src/test.cql
+src/util.lo
+compile
+depcomp
+install-sh
+ltmain.sh
+m4/
+missing
+stamp-h1
