@@ -44,10 +44,11 @@ int pack_string_common(char *in, char **out, char long_string);
 int unpack_long(char *buffer, long *n);
 int unpack_short(char *buffer, short *n);
 int unpack_bytes(char *in, char **out, long *out_length);
-int unpack_string_multimap(char *in, int in_len, cql_string_multimap **out);
 int unpack_string_common(char *in, char **string, char long_string);
 #define unpack_string(in, out) unpack_string_common(in, out, 0)
 #define unpack_long_string(in, out) unpack_string_common(in, out, 1)
+int unpack_string_list(char *in, cql_string_list **list);
+int unpack_string_multimap(char *in, int in_len, cql_string_multimap **out);
 
 int add_pointer(char ***list, int size, char *new_element);
 
@@ -808,7 +809,41 @@ int unpack_bytes(char *in, char **out, long *out_length) {
 }
 
 int unpack_string_multimap(char *in, int in_len, cql_string_multimap **out) {
-	// TODO Implement this
+	char *in_offset = in;
+	unsigned short size = 0;
+	in_offset += unpack_short(in_offset, &size);
+
+	int multimap_size = sizeof(cql_string_multimap) * size;
+	cql_string_multimap *multimap = malloc(multimap_size);
+	memset(multimap, 0, multimap_size);
+
+	int i;
+	for(i = 0; i < size; i++) {
+		in_offset += unpack_string(in_offset, &multimap[i].key);
+		in_offset += unpack_string_list(in_offset, &multimap[i].value);
+	}
+
+	*out = multimap;
+
+	return in_offset - in;
+}
+
+int unpack_string_list(char *in, cql_string_list **list) {
+	*list = malloc(sizeof(cql_string_list));
+	memset(*list, 0, sizeof(cql_string_list));
+
+	char *in_offset = in;
+	in_offset += unpack_short(in_offset, &((*list)->values_count));
+
+	(*list)->values = malloc(sizeof(char*) * (*list)->values_count);
+	memset((*list)->values, 0, (*list)->values_count);
+
+	int i;
+	for(i = 0; i < (*list)->values_count; i++) {
+		in_offset += unpack_string(in_offset, (*list)->values[i]);
+	}
+
+	return in_offset - in;
 }
 
 uint32_t pack_long(char *buffer, uint32_t i) {
