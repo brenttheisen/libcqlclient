@@ -196,7 +196,7 @@ int cql_session_create(cql_cluster *cluster, cql_session **session, void **resul
 int cql_session_query(cql_session *session, char *query, unsigned short consistency, void **result);
 void cql_session_destroy(cql_session *session);
 
-int cql_create_connection(cql_session *session, cql_host *host, cql_connection **connection, void **result);
+int cql_connection_create(cql_host *host, void **result);
 int cql_connection_query(cql_connection *connection, char *query, unsigned short consistency, void **result);
 void cql_connection_destroy(cql_connection *connection);
 

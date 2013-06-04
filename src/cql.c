@@ -164,20 +164,21 @@ int cql_session_create(cql_cluster *cluster, cql_session **session, void **resul
 
 	int i;
 	for(i = 0; i < cluster->hosts_count; i++) {
-		cql_connection *connection;
-		int res = cql_create_connection(*session, cluster->hosts[i], &connection, result);
+    void *connection_res;
+		int res = cql_connection_create(cluster->hosts[i], &connection_res);
 		if(res != CQL_RESULT_SUCCESS) {
+      *result = connection_res;
 			cql_session_destroy(*session);
 			return res;
 		}
 
-		add_pointer((char***) &((*session)->connections), (*session)->connections_count, (char*) connection);
+		add_pointer((char***) &((*session)->connections), (*session)->connections_count, (char*) connection_res);
 	}
 
 	return CQL_RESULT_SUCCESS;
 }
 
-int cql_create_connection(cql_session *session, cql_host *host, cql_connection **connection, void **result) {
+int cql_connection_create(cql_host *host, void **result) {
 	struct addrinfo hints;
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_socktype = SOCK_STREAM;
@@ -203,17 +204,18 @@ int cql_create_connection(cql_session *session, cql_host *host, cql_connection *
 	if(sfd == -1)
 		return cql_client_error_create(result, "Could not connect socket to %s:%s", host->hostname, host->port);
 
-	*connection = malloc(sizeof(cql_connection));
-	memset(*connection, 0, sizeof(cql_connection));
+	cql_connection *connection = malloc(sizeof(cql_connection));
+	memset(connection, 0, sizeof(cql_connection));
+	connection->fd = sfd;
+	connection->next_stream_id = 1;
 
-	(*connection)->fd = sfd;
-	(*connection)->next_stream_id = 1;
-
-	res = perform_startup_exchange(*connection, result);
+	res = perform_startup_exchange(connection, result);
 	if(res != CQL_RESULT_SUCCESS) {
-		cql_connection_destroy(*connection);
+		cql_connection_destroy(connection);
 		return res;
 	}
+
+  *result = connection;
 
 	return CQL_RESULT_SUCCESS;
 }
