@@ -89,11 +89,6 @@ typedef struct {
 } cql_result;
 
 typedef struct {
-	unsigned short id;
-	void *value;
-} cql_option;
-
-typedef struct {
 	char *keyspace;
 	char *table_name;
 	char *column_name;
@@ -109,7 +104,7 @@ typedef struct {
 	char *global_keyspace;
 	char *global_table_name;
 	cql_column **columns;
-} cql_rows_metadata;
+} cql_metadata;
 
 typedef struct {
 	unsigned long length;
@@ -117,15 +112,21 @@ typedef struct {
 } cql_column_value;
 
 typedef struct {
-	cql_rows_metadata *metadata;
+	cql_metadata *metadata;
 	unsigned long rows_count;
 	cql_column_value ***rows;
 } cql_rows_result;
 
 typedef struct {
+	cql_connection *connection;
+	char *id;
+	unsigned short id_length;
+	cql_metadata *metadata;
+} cql_prepared_statement;
+
+typedef struct {
 	char *message;
 } cql_client_error;
-
 
 typedef struct {
 	char opcode;

@@ -24,29 +24,45 @@
 
 #define ROW_METADATA_FLAG_GLOBAL_TABLES 0x0001
 
-int cql_client_error_create(void **result, const char *format, ...);
-int cql_result_create(cql_frame *frame, void **result);
-long cql_server_error_create(cql_frame *frame, cql_server_error **error);
+#define PACK_BUFFER_BLOCK_SIZE 512
+
+typedef struct {
+	char *data;
+	unsigned long written_len;
+	unsigned long alloc_len;
+} pack_buffer;
+
+int cql_client_error_create(void **result, char *format, ...);
+long cql_server_error_create(char *body, cql_server_error **error);
+int cql_result_create(char *in, void **result);
 
 int perform_startup_exchange(cql_connection *connection, void **result);
 
-int round_trip_request_response(cql_connection *connection, cql_frame *request, cql_frame **response);
+int round_trip_request_response(cql_connection *connection, cql_frame *request, cql_frame *response);
 int send_frame(cql_connection *connection, cql_frame *request);
-int read_frame(cql_connection *connection, cql_frame **response, char target_stream_id);
+int read_frame(cql_connection *connection, cql_frame *response, char target_stream_id);
 
-uint32_t pack_long(char *buffer, uint32_t i);
-uint16_t pack_short(char *buffer, uint16_t i);
-int pack_string_map(cql_string_map *map, unsigned short element_count, char** buffer);
-int pack_string_common(char *in, char **out, char long_string);
-#define pack_string(in, out) pack_string_common(in, out, 0)
-#define pack_long_string(in, out) pack_string_common(in, out, 1)
+void pack_char(pack_buffer *buffer, char c);
+void pack_long(pack_buffer *buffer, uint32_t i);
+void pack_short(pack_buffer *buffer, uint16_t i);
+void pack_string_map(pack_buffer *buffer, cql_string_map *map, unsigned short element_count);
+void pack_string_common(pack_buffer *buffer, char *in, char long_string);
+#define pack_string(buffer, in) pack_string_common(buffer, in, 0)
+#define pack_long_string(buffer, in) pack_string_common(buffer, in, 1)
+void write_pack_buffer(pack_buffer *buffer, char *bytes, unsigned long len);
 
-int unpack_long(char *buffer, long *n);
-int unpack_short(char *buffer, short *n);
-int unpack_bytes(char *in, char **out, long *out_length);
+int unpack_char(char *buffer, char *c);
+int unpack_signed_short(char *buffer, short *n);
+int unpack_unsigned_short(char *buffer, unsigned short *n);
+int unpack_signed_long(char *buffer, long *n);
+int unpack_unsigned_long(char *buffer, unsigned long *n);
+
+int unpack_bytes_common(char *in, char **out, long *out_length, char long_bytes);
+#define unpack_bytes(in, out, out_length) unpack_bytes_common(in, out, out_length, 1)
+#define unpack_short_bytes(in, out, out_length) unpack_bytes_common(in, out, out_length, 0)
 int unpack_string_common(char *in, char **string, char long_string);
 #define unpack_string(in, out) unpack_string_common(in, out, 0)
-#define unpack_long_string(in, out) unpack_string_common(in, out, 1)
+#define unpack_signed_long_string(in, out) unpack_string_common(in, out, 1)
 int unpack_string_list(char *in, cql_string_list **list);
 int unpack_string_multimap(char *in, int in_len, cql_string_multimap **out);
 
@@ -85,16 +101,19 @@ int cql_host_create(cql_cluster *cluster, cql_host **host, char *host_port, void
 	return CQL_RESULT_SUCCESS;
 }
 
-int cql_client_error_create(void **result, const char *format, ...) {
+int cql_client_error_create(void **result, char *format, ...) {
 	if(result && format) {
+
 		cql_client_error *error = malloc(sizeof(cql_client_error));
 		memset(error, 0, sizeof(cql_client_error));
 
 		va_list args;
 		va_start(args, format);
-
 		int len = vsnprintf(NULL, 0, format, args);
+		va_end(args);
+
 		error->message = malloc(len + 1);
+		va_start(args, format);
 		vsnprintf(error->message, len + 1, format, args);
 		va_end(args);
 
@@ -200,50 +219,108 @@ int cql_create_connection(cql_session *session, cql_host *host, cql_connection *
 }
 
 int cql_connection_query(cql_connection *connection, char *query, unsigned short consistency, void **result) {
-	char *serialized_query;
-	int serialized_query_len = pack_long_string(query, &serialized_query);
-
 	cql_frame request;
+	memset(&request, 0, sizeof(cql_frame));
 	request.opcode = OPCODE_QUERY;
-	request.length = serialized_query_len + 2;
-	request.body = malloc(request.length);
-	memcpy(request.body, serialized_query, serialized_query_len);
-	pack_short(request.body + serialized_query_len, consistency);
 
-	cql_frame *response;
+	pack_buffer buffer;
+	memset(&buffer, 0, sizeof(pack_buffer));
+	pack_long_string(&buffer, query);
+	pack_short(&buffer, consistency);
+	request.length = buffer.written_len;
+	request.body = buffer.data;
+
+	cql_frame response;
 	int round_trip_res = round_trip_request_response(connection, &request, &response);
 	free(request.body);
 	if(!round_trip_res)
 		return cql_client_error_create(result, "Unable to round trip frames");
 
-	switch(response->opcode) {
+	switch(response.opcode) {
 	case OPCODE_RESULT:
-		return cql_result_create(response, result);
+		return cql_result_create(response.body, result);
 	case OPCODE_ERROR:
-		cql_server_error_create(response, (cql_server_error**) result);
+		cql_server_error_create(response.body, (cql_server_error**) result);
 		return CQL_RESULT_SERVER_ERROR;
 	}
 
-	return unexpected_opcode(result, response->opcode);
+	return unexpected_opcode(result, response.opcode);
 }
 
 int cql_connection_options(cql_connection *connection, void **result) {
 	cql_frame request;
+	memset(&request, 0, sizeof(request));
 	request.opcode = OPCODE_OPTIONS;
-	request.length = 0;
-	request.body = 0;
 
-	cql_frame *response;
-	if(round_trip_request_response(connection, &request, (cql_frame**) response) == 0)
+	cql_frame response;
+	if(round_trip_request_response(connection, &request, &response) == 0)
 		return cql_client_error_create(result, "Unable to round trip frames");
 
-	switch(response->opcode) {
-	case OPCODE_SUPPORTED:
-		unpack_string_multimap(request.body, request.length, &response);
-		return CQL_RESULT_SUCCESS;
+	int result_code;
+	if(response.opcode == OPCODE_SUPPORTED) {
+		cql_string_multimap *string_multimap;
+		unpack_string_multimap(response.body, response.length, &string_multimap);
+
+		result_code = CQL_RESULT_SUCCESS;
+		*result = string_multimap;
+	} else {
+		result_code = unexpected_opcode(result, response.opcode);
 	}
 
-	return unexpected_opcode(result, response->opcode);
+	free(response.body);
+
+	return result_code;
+}
+
+int cql_connection_prepare(cql_connection *connection, char *query, void **result) {
+	cql_frame request;
+	request.opcode = OPCODE_PREPARE;
+	pack_buffer buffer;
+	memset(&buffer, 0, sizeof(pack_buffer));
+	pack_long_string(&buffer, query);
+	request.length = buffer.written_len;
+	request.body = buffer.data;
+
+	cql_frame response;
+	int res = round_trip_request_response(connection, &request, &response);
+	free(request.body);
+	if(res == 0)
+		return cql_client_error_create(result, "Unable to round trip frames");
+
+	int result_code;
+	if(response.opcode == OPCODE_RESULT) {
+		cql_prepared_statement *prepared_statement = malloc(sizeof(cql_prepared_statement));
+		memset(prepared_statement, 0, sizeof(cql_prepared_statement));
+
+		char *body_offset = response.body;
+    long id_length;
+		body_offset += unpack_bytes(body_offset, &(prepared_statement->id), &id_length);
+    prepared_statement->id_length = id_length;
+		body_offset += unpack_cql_metadata(body_offset, &(prepared_statement->metadata));
+
+		result_code = CQL_RESULT_SUCCESS;
+		*result = prepared_statement;
+	} else {
+		return unexpected_opcode(result, response.opcode);
+	}
+
+	free(response.body);
+
+	return result_code;
+}
+
+int cql_connection_execute(cql_prepared_statement *prepared_statement, char **values, unsigned short values_count, unsigned short consistency) {
+	pack_buffer buffer;
+	memset(&buffer, 0, sizeof(pack_buffer));
+
+	pack_short_bytes(&buffer, prepared_statement->id, prepared_statement->id_length);
+
+	cql_frame request;
+	request.opcode = OPCODE_EXECUTE;
+	request.body = buffer.data;
+	request.length = buffer.written_len;
+
+	free(buffer.data);
 }
 
 int cql_session_query(cql_session *session, char *query, unsigned short consistency, void **result) {
@@ -300,94 +377,106 @@ int perform_startup_exchange(cql_connection *connection, void **result) {
 
 	cql_frame request;
 	request.opcode = OPCODE_STARTUP;
-	request.length = pack_string_map(&body_map, 1, &request.body);
+	pack_buffer buffer;
+	memset(&buffer, 0, sizeof(pack_buffer));
+	pack_string_map(&buffer, &body_map, 1);
+	request.body = buffer.data;
+	request.length = buffer.written_len;
+
 	int stream_id = send_frame(connection, &request);
 	free(request.body);
 	if(stream_id == 0)
 		return 0;
 
-	cql_frame *response;
+	cql_frame response;
 	if(read_frame(connection, &response, stream_id) == 0)
 		return 0;
 
-	switch(response->opcode) {
+	switch(response.opcode) {
 	case OPCODE_READY:
 		return CQL_RESULT_SUCCESS;
 	case OPCODE_ERROR:
 		if(result)
-			cql_server_error_create(response, (cql_server_error**) result);
+			cql_server_error_create(response.body, (cql_server_error**) result);
 		return CQL_RESULT_SERVER_ERROR;
 	}
 
-	return unexpected_opcode(result, response->opcode);
+	return unexpected_opcode(result, response.opcode);
 }
 
 int unexpected_opcode(void **result, int opcode) {
 	return cql_client_error_create(result, "Got unexpected opcode %d", opcode);
 }
 
-int cql_result_create(cql_frame *frame, void **result) {
-	cql_result *res = malloc(sizeof(cql_result));
-	memset(res, 0, sizeof(cql_result));
+int unpack_cql_metadata(char *in, cql_metadata **out) {
+	cql_metadata *metadata = malloc(sizeof(cql_metadata));
+	memset(metadata, 0, sizeof(cql_metadata));
 
-	char *body_offset = frame->body;
-	body_offset += unpack_long(body_offset, &(res->kind));
+	char *in_offset = in;
+	in_offset += unpack_unsigned_long(in_offset, &(metadata->flags));
+	in_offset += unpack_unsigned_long(in_offset, &(metadata->columns_count));
+	if(metadata->flags & ROW_METADATA_FLAG_GLOBAL_TABLES) {
+		in_offset += unpack_string(in_offset, &(metadata->global_keyspace));
+		in_offset += unpack_string(in_offset, &(metadata->global_table_name));
+	}
 
-	switch(res->kind) {
+	if(metadata->columns_count > 0) {
+		int columns_size = sizeof(cql_column*) * metadata->columns_count;
+		metadata->columns = malloc(columns_size);
+		memset(metadata->columns, 0, columns_size);
+
+		int i;
+		for(i = 0; i < metadata->columns_count; i++) {
+			cql_column *column = metadata->columns[i] = malloc(sizeof(cql_column));
+			memset(column, 0, sizeof(cql_column));
+
+			if(!(metadata->flags & ROW_METADATA_FLAG_GLOBAL_TABLES)) {
+				in_offset += unpack_string(in_offset, &(column->keyspace));
+				in_offset += unpack_string(in_offset, &(column->table_name));
+			}
+
+			in_offset += unpack_string(in_offset, &(column->column_name));
+			in_offset += unpack_unsigned_short(in_offset, &(column->type));
+			switch(column->type) {
+			case CQL_COLUMN_TYPE_CUSTOM:
+				in_offset += unpack_string(in_offset, &(column->custom_type));
+				break;
+			case CQL_COLUMN_TYPE_LIST:
+			case CQL_COLUMN_TYPE_SET:
+			case CQL_COLUMN_TYPE_MAP:
+				in_offset += unpack_unsigned_short(in_offset, &(column->list_type));
+				if(column->type == CQL_COLUMN_TYPE_MAP)
+					in_offset += unpack_unsigned_short(in_offset, &(column->value_type));
+				break;
+			}
+		}
+	}
+
+	*out = metadata;
+	return in_offset - in;
+}
+
+int cql_result_create(char *in, void **res) {
+	cql_result *result = malloc(sizeof(cql_result));
+	memset(result, 0, sizeof(cql_result));
+
+	char *in_offset = in;
+	in_offset += unpack_signed_long(in_offset, &(result->kind));
+
+	switch(result->kind) {
 	case CQL_RESULT_KIND_VOID:
 		// Noop cause there is no data
-		res->data = NULL;
+		result->data = NULL;
 		break;
 	case CQL_RESULT_KIND_ROWS:
 		{
 			cql_rows_result *rows_result = malloc(sizeof(cql_rows_result));
 			memset(rows_result, 0, sizeof(cql_rows_result));
 
-			cql_rows_metadata *metadata = malloc(sizeof(cql_rows_metadata));
-			memset(metadata, 0, sizeof(cql_rows_metadata));
+			in_offset += unpack_cql_metadata(in_offset, &(rows_result->metadata));
+			cql_metadata *metadata = rows_result->metadata;
 
-			body_offset += unpack_long(body_offset, &(metadata->flags));
-			body_offset += unpack_long(body_offset, &(metadata->columns_count));
-			if(metadata->flags & ROW_METADATA_FLAG_GLOBAL_TABLES) {
-				body_offset += unpack_string(body_offset, &(metadata->global_keyspace));
-				body_offset += unpack_string(body_offset, &(metadata->global_table_name));
-			}
-
-			if(metadata->columns_count > 0) {
-				int columns_size = sizeof(cql_column*) * metadata->columns_count;
-				metadata->columns = malloc(columns_size);
-				memset(metadata->columns, 0, columns_size);
-
-				int i;
-				for(i = 0; i < metadata->columns_count; i++) {
-					cql_column *column = metadata->columns[i] = malloc(sizeof(cql_column));
-					memset(column, 0, sizeof(cql_column));
-
-					if(!(metadata->flags & ROW_METADATA_FLAG_GLOBAL_TABLES)) {
-						body_offset += unpack_string(body_offset, &(column->keyspace));
-						body_offset += unpack_string(body_offset, &(column->table_name));
-					}
-
-					body_offset += unpack_string(body_offset, &(column->column_name));
-					body_offset += unpack_short(body_offset, &(column->type));
-					switch(column->type) {
-					case CQL_COLUMN_TYPE_CUSTOM:
-						body_offset += unpack_string(body_offset, &(column->custom_type));
-						break;
-					case CQL_COLUMN_TYPE_LIST:
-					case CQL_COLUMN_TYPE_SET:
-					case CQL_COLUMN_TYPE_MAP:
-						body_offset += unpack_short(body_offset, &(column->list_type));
-						if(column->type == CQL_COLUMN_TYPE_MAP)
-							body_offset += unpack_short(body_offset, &(column->value_type));
-						break;
-					}
-				}
-			}
-			rows_result->metadata = metadata;
-
-			body_offset += unpack_long(body_offset, &(rows_result->rows_count));
-
+			in_offset += unpack_signed_long(in_offset, &(rows_result->rows_count));
 			int rows_size = sizeof(cql_column_value**) * rows_result->rows_count;
 			rows_result->rows = malloc(rows_size);
 			memset(rows_result->rows, 0, rows_size);
@@ -403,8 +492,8 @@ int cql_result_create(cql_frame *frame, void **result) {
 					cql_column *column_metadata = metadata->columns[column_index];
 
 					char *bytes = NULL;
-					long bytes_length = 0;
-					body_offset += unpack_bytes(body_offset, &bytes, &bytes_length);
+					long bytes_length;
+					in_offset += unpack_bytes(in_offset, &bytes, &bytes_length);
 
 					if(bytes_length < 0)
 						continue;
@@ -423,17 +512,17 @@ int cql_result_create(cql_frame *frame, void **result) {
 							break;
 						case CQL_COLUMN_TYPE_BOOLEAN:
 							if(bytes_length != sizeof(char))
-								printf("BAD BOOLEAN SIZE %d\n", bytes_length); // Handle error
+								printf("BAD BOOLEAN SIZE %lu\n", bytes_length); // Handle error
 							column_value->length = bytes_length;
 							column_value->value = malloc(column_value->length);
 							memcpy(column_value->value, bytes, column_value->length);
 							break;
 						case CQL_COLUMN_TYPE_INT:
 							if(bytes_length != 4)
-								printf("BAD 32 INT SIZE %d\n", bytes_length); // Handle error
+								printf("BAD 32 INT SIZE %lu\n", bytes_length); // Handle error
 							column_value->length = bytes_length;
 							column_value->value = malloc(column_value->length);
-							unpack_long(bytes, (long *) &column_value->value);
+							unpack_signed_long(bytes, (long *) &column_value->value);
 							break;
 						case CQL_COLUMN_TYPE_BIGINT:
 						case CQL_COLUMN_TYPE_COUNTER:
@@ -489,30 +578,37 @@ int cql_result_create(cql_frame *frame, void **result) {
 				rows_result->rows[row_index] = row;
 			}
 
-			res->data = rows_result;
+			result->data = rows_result;
 		}
 		break;
 	case CQL_RESULT_KIND_SET_KEYSPACE:
-		unpack_string(body_offset, (char **) &(res->data));
+		in_offset += unpack_string(in_offset, (char **) &(result->data));
 		break;
 	case CQL_RESULT_KIND_PREPARED:
-		// TODO Implement this
+		{
+			cql_prepared_statement *prepared_statement = malloc(sizeof(cql_prepared_statement));
+			memset(prepared_statement, 0, sizeof(cql_prepared_statement));
+
+			in_offset += unpack_signed_long_bytes(in_offset, &(prepared_statement->id));
+			in_offset += unpack_metadata(in_offset, &(prepared_statement->metadata));
+		}
 		break;
 	case CQL_RESULT_KIND_SCHEMA_CHANGE:
 		{
 			cql_schema_change *sc = malloc(sizeof(cql_schema_change));
-			body_offset += unpack_string(body_offset, &(sc->change));
-			body_offset += unpack_string(body_offset, &(sc->keyspace));
-			body_offset += unpack_string(body_offset, &(sc->table));
-			res->data = sc;
+			in_offset += unpack_string(in_offset, &(sc->change));
+			in_offset += unpack_string(in_offset, &(sc->keyspace));
+			in_offset += unpack_string(in_offset, &(sc->table));
+			result->data = sc;
 		}
 		break;
 	default:
-		cql_result_destroy(res);
-		return cql_client_error_create(result, "Unknown result kind %d", res->kind);
+		// TODO Need to look at this
+		// cql_result_destroy(result);
+		return cql_client_error_create((void**) result, "Unknown result kind %lu", result->kind);
 	}
 
-	*result = (void*) res;
+	*res = (void*) result;
 
 	return CQL_RESULT_SUCCESS;
 }
@@ -531,7 +627,7 @@ void cql_result_destroy(cql_result *result) {
 		case CQL_RESULT_KIND_ROWS:
 			{
 				cql_rows_result *rows_result = result->data;
-				cql_rows_metadata *metadata = rows_result->metadata;
+				cql_metadata *metadata = rows_result->metadata;
 				if(metadata && rows_result->rows) {
 					int rows_index;
 					for(rows_index = 0; rows_index < rows_result->rows_count; rows_index++) {
@@ -598,28 +694,28 @@ void cql_result_destroy(cql_result *result) {
 	free(result);
 }
 
-long cql_server_error_create(cql_frame *frame, cql_server_error **error) {
+long cql_server_error_create(char *body, cql_server_error **error) {
 	cql_server_error *err = malloc(sizeof(cql_server_error));
-	char *body_offset = frame->body;
-	body_offset += unpack_long(body_offset, &(err->code));
+	char *body_offset = body;
+	body_offset += unpack_signed_long(body_offset, &(err->code));
 	body_offset += unpack_string(body_offset, &err->message);
 
 	switch(err->code) {
 	case CQL_ERROR_UNAVAILABLE:
 		{
 			cql_unavailable *unavailable = malloc(sizeof(cql_unavailable));
-			body_offset += unpack_short(body_offset, &(unavailable->consistency));
-			body_offset += unpack_long(body_offset, &(unavailable->required_nodes));
-			body_offset += unpack_long(body_offset, &(unavailable->alive_nodes));
+			body_offset += unpack_unsigned_short(body_offset, &(unavailable->consistency));
+			body_offset += unpack_signed_long(body_offset, &(unavailable->required_nodes));
+			body_offset += unpack_signed_long(body_offset, &(unavailable->alive_nodes));
 			err->additional = unavailable;
 		}
 		break;
 	case CQL_ERROR_WRITE_TIMEOUT:
 		{
 			cql_write_timeout *write_timeout = malloc(sizeof(cql_write_timeout)); // Memory leak
-			body_offset += unpack_short(body_offset, &(write_timeout->consistency));
-			body_offset += unpack_long(body_offset, &(write_timeout->nodes_received));
-			body_offset += unpack_long(body_offset, &(write_timeout->nodes_required));
+			body_offset += unpack_unsigned_short(body_offset, &(write_timeout->consistency));
+			body_offset += unpack_signed_long(body_offset, &(write_timeout->nodes_received));
+			body_offset += unpack_signed_long(body_offset, &(write_timeout->nodes_required));
 			body_offset += unpack_string(body_offset, &write_timeout->write_type); // Memory leak
 
 			err->additional = write_timeout;
@@ -628,9 +724,9 @@ long cql_server_error_create(cql_frame *frame, cql_server_error **error) {
 	case CQL_ERROR_READ_TIMEOUT:
 		{
 			cql_read_timeout *read_timeout = malloc(sizeof(cql_read_timeout)); // Memory leak
-			body_offset += unpack_short(body_offset, &(read_timeout->consistency));
-			body_offset += unpack_long(body_offset, &(read_timeout->nodes_received));
-			body_offset += unpack_long(body_offset, &(read_timeout->nodes_required));
+			body_offset += unpack_unsigned_short(body_offset, &(read_timeout->consistency));
+			body_offset += unpack_signed_long(body_offset, &(read_timeout->nodes_received));
+			body_offset += unpack_signed_long(body_offset, &(read_timeout->nodes_required));
 
 			memcpy(&read_timeout->data_present, body_offset, 1);
 			body_offset++;
@@ -653,7 +749,7 @@ long cql_server_error_create(cql_frame *frame, cql_server_error **error) {
 	return (*error)->code;
 }
 
-int round_trip_request_response(cql_connection *connection, cql_frame *request, cql_frame **response) {
+int round_trip_request_response(cql_connection *connection, cql_frame *request, cql_frame *response) {
 	int stream_id;
 	if(!(stream_id = send_frame(connection, request)))
 		return 0;
@@ -662,63 +758,67 @@ int round_trip_request_response(cql_connection *connection, cql_frame *request, 
 }
 
 int send_frame(cql_connection *connection, cql_frame *request) {
-	int out_buffer_size = 8 + request->length;
-	char out_buffer[out_buffer_size];
-	out_buffer[0] = 0x01;
-	out_buffer[1] = 0x01;
-	out_buffer[2] = connection->next_stream_id++;
-	out_buffer[3] = request->opcode;
+	int stream_id = connection->next_stream_id++;
 
-	pack_long(out_buffer + 4, request->length);
-	memcpy(out_buffer + 8, request->body, request->length);
+	pack_buffer buffer;
+	memset(&buffer, 0, sizeof(pack_buffer));
 
-	if(write(connection->fd, out_buffer, out_buffer_size) != out_buffer_size)
-		return 0;
+	pack_char(&buffer, 0x01);
+	pack_char(&buffer, 0x01);
+	pack_char(&buffer, stream_id);
+	pack_char(&buffer, request->opcode);
 
-	return out_buffer[2];
+	pack_long(&buffer, request->length);
+	write_pack_buffer(&buffer, request->body, request->length);
+
+	int wrote_all = write(connection->fd, buffer.data, buffer.written_len) == buffer.written_len;
+	free(buffer.data);
+
+	return !wrote_all ? 0 : stream_id;
 }
 
 // TODO This function needs to be replaced by epoll/kqueue or something
-int read_frame(cql_connection *connection, cql_frame **response, char target_stream_id) {
+int read_frame(cql_connection *connection, cql_frame *response, char target_stream_id) {
 	const int BLOCK_BUFFER_SIZE = 1024;
+
+	memset(response, 0, sizeof(cql_frame));
 
 	char block_buffer[BLOCK_BUFFER_SIZE];
 	char *buffer = NULL;
-	int cont = 1;
-	int bytes_read = 0;
+	unsigned long bytes_read = 0;
 	int readres;
-	while(cont) {
+	// TODO This loop could be infinite. Need poll() with timeout.
+	for(;;) {
 		readres = read(connection->fd, block_buffer, BLOCK_BUFFER_SIZE);
 		if(readres > 0) {
-			char *new_buffer = malloc(bytes_read + readres);
-			if(bytes_read > 0)
-				memcpy(&new_buffer, buffer, bytes_read);
-			memcpy(new_buffer + bytes_read, block_buffer, readres);
-			free(buffer);
-			buffer = new_buffer;
+			buffer = realloc(buffer, bytes_read + readres);
+			memcpy(buffer + bytes_read, block_buffer, readres);
 			bytes_read += readres;
 		}
 
-		cont = readres == 0 || readres == BLOCK_BUFFER_SIZE;
+		if(readres != 0 && readres != BLOCK_BUFFER_SIZE)
+			break;
 	}
 
 	if(readres == -1)
 		return 0;
 
-	unsigned long bytes_processed = 0;
-	*response = NULL;
-	while(bytes_processed < bytes_read && *response == NULL) {
-		if(bytes_read - bytes_processed < 8)
-			return 0;
+  char *buffer_offset = buffer;
+  int response_found = 0;
+	while((buffer_offset - buffer) < bytes_read) {
+		if(bytes_read - (buffer_offset - buffer) < 8)
+			break; // TODO Client error saying not enough room for another frame
 
-		char version = buffer[0];
-		char flags = buffer[1];
-		char stream = buffer[2];
-		char opcode = buffer[3];
-		char *buffer_offset = buffer + 4;
+		char version, flags, stream, opcode;
+		long length;
+    buffer_offset += unpack_char(buffer_offset, &version);
+    buffer_offset += unpack_char(buffer_offset, &flags);
+    buffer_offset += unpack_char(buffer_offset, &stream);
+    buffer_offset += unpack_char(buffer_offset, &opcode);
+		buffer_offset += unpack_unsigned_long(buffer_offset, &length);
 
-		unsigned long length;
-		buffer_offset += unpack_long(buffer_offset, &length);
+		if((buffer_offset - buffer) + length > bytes_read)
+			break; // TODO Client error saying not enough room for frame body
 
 		char *body = NULL;
 		if(length > 0) {
@@ -728,63 +828,71 @@ int read_frame(cql_connection *connection, cql_frame **response, char target_str
 
 		// TODO This is lame because we could read and ignore frames
 		if(stream == target_stream_id) {
-			*response = malloc(sizeof(cql_frame)); // TODO Memory leak
-			(*response)->opcode = opcode;
-			(*response)->length = length;
-			(*response)->body = body;
+			response->opcode = opcode;
+			response->length = length;
+			response->body = body;
+      response_found = 1;
+      break;
 		}
+
+    free(body);
 	}
 	free(buffer);
 
-	return *response != NULL;
+	return response_found;
 }
 
-int pack_string_map(cql_string_map *map, unsigned short element_count, char** buffer) {
-	int buffer_size = 2, i;
+void pack_string_map(pack_buffer *buffer, cql_string_map *map, unsigned short element_count) {
+	pack_short(buffer, element_count);
+
+	int i;
 	for(i = 0; i < element_count; i++) {
-		buffer_size += strlen(map[i].key) + strlen(map[i].value) + 4;
+		pack_string(buffer, map[i].key);
+		pack_string(buffer, map[i].value);
 	}
-
-	*buffer = malloc(buffer_size);
-	memset(*buffer, 0, buffer_size);
-	pack_short(*buffer, element_count);
-
-	char *buffer_offset = *buffer + 2;
-	for(i = 0; i < element_count; i++) {
-		char *serialized_key;
-		int key_size = pack_string(map[i].key, &serialized_key);
-		memcpy(buffer_offset, serialized_key, key_size);
-		buffer_offset += key_size;
-		free(serialized_key);
-
-		char *serialized_value;
-		int value_size = pack_string(map[i].value, &serialized_value);
-		memcpy(buffer_offset, serialized_value, value_size);
-		buffer_offset += value_size;
-		free(serialized_value);
-	}
-
-	return buffer_size;
 }
 
-int pack_string_common(char *in, char **out, char long_string) {
+void pack_string_common(pack_buffer *buffer, char *in, char long_string) {
 	unsigned long len = strlen(in);
 	char int_size = long_string ? 4 : 2;
-	*out = malloc(len + int_size);
-	if(long_string)
-		pack_long(*out, len);
-	else
-		pack_short(*out, (unsigned short) len);
-	if(len > 0)
-		memcpy(*out + int_size, in, len);
 
-	return len + int_size;
+	if(long_string)
+		pack_long(buffer, len);
+	else
+		pack_short(buffer, (unsigned short) len);
+
+	if(len > 0)
+		write_pack_buffer(buffer, in, len);
+}
+
+void pack_char(pack_buffer *buffer, char c) {
+	write_pack_buffer(buffer, &c, sizeof(char));
+}
+
+void pack_long(pack_buffer *buffer, uint32_t i) {
+	uint32_t n = htonl(i);
+	write_pack_buffer(buffer, (char *) &n, sizeof(n));
+}
+
+void pack_short(pack_buffer *buffer, uint16_t i) {
+	uint16_t n = htons(i);
+	write_pack_buffer(buffer, (char *) &n, sizeof(n));
+}
+
+void write_pack_buffer(pack_buffer *buffer, char *bytes, unsigned long len) {
+	if(buffer->written_len + len > buffer->alloc_len) {
+		buffer->alloc_len += PACK_BUFFER_BLOCK_SIZE;
+		buffer->data = realloc(buffer->data, buffer->alloc_len);
+	}
+
+	memcpy(buffer->data + buffer->written_len, bytes, len);
+	buffer->written_len += len;
 }
 
 int unpack_string_common(char *in, char **out, char long_string) {
 	char *in_offset = in;
 	unsigned long len = 0;
-	in_offset += long_string ? unpack_long(in, &len) : unpack_short(in, &len);
+	in_offset += long_string ? unpack_signed_long(in, &len) : unpack_unsigned_short(in, (unsigned short*) &len);
 	char int_size = long_string ? 4 : 2;
 	*out = malloc(len + 1);
 	if(len > 0)
@@ -794,15 +902,23 @@ int unpack_string_common(char *in, char **out, char long_string) {
 	return int_size + len;
 }
 
-int unpack_bytes(char *in, char **out, long *out_length) {
+int unpack_bytes_common(char *in, char **out, long *out_length, char long_bytes) {
 	char *in_offset = in;
-	in_offset += unpack_long(in_offset, out_length);
-	if(*out_length < 0) {
-		*out = NULL;
+	if(long_bytes) {
+		in_offset += unpack_signed_long(in_offset, out_length);
 	} else {
-		*out = malloc(*out_length);
-		memcpy(*out, in_offset, *out_length);
-		in_offset += *out_length;
+    short tmp_out_length;
+		in_offset += unpack_signed_short(in_offset, &tmp_out_length);
+    *out_length = tmp_out_length;
+  }
+
+	long len = *out_length;
+	if(len > 0) {
+		*out = malloc(len);
+		memcpy(*out, in_offset, len);
+		in_offset += len;
+	} else {
+		*out = NULL;
 	}
 
 	return in_offset - in;
@@ -811,7 +927,7 @@ int unpack_bytes(char *in, char **out, long *out_length) {
 int unpack_string_multimap(char *in, int in_len, cql_string_multimap **out) {
 	char *in_offset = in;
 	unsigned short size = 0;
-	in_offset += unpack_short(in_offset, &size);
+	in_offset += unpack_unsigned_short(in_offset, &size);
 
 	int multimap_size = sizeof(cql_string_multimap) * size;
 	cql_string_multimap *multimap = malloc(multimap_size);
@@ -833,41 +949,44 @@ int unpack_string_list(char *in, cql_string_list **list) {
 	memset(*list, 0, sizeof(cql_string_list));
 
 	char *in_offset = in;
-	in_offset += unpack_short(in_offset, &((*list)->values_count));
+	in_offset += unpack_unsigned_short(in_offset, &((*list)->values_count));
 
 	(*list)->values = malloc(sizeof(char*) * (*list)->values_count);
 	memset((*list)->values, 0, (*list)->values_count);
 
 	int i;
 	for(i = 0; i < (*list)->values_count; i++) {
-		in_offset += unpack_string(in_offset, (*list)->values[i]);
+		in_offset += unpack_string(in_offset, &(*list)->values[i]);
 	}
 
 	return in_offset - in;
 }
 
-uint32_t pack_long(char *buffer, uint32_t i) {
-	uint32_t n = htonl(i);
-	memcpy(buffer, &n, sizeof(n));
-	return n;
+int unpack_signed_short(char *buffer, short *n) {
+  memcpy(n, buffer, 2);
+  *n = (int16_t) ntohs(*n);
+  return 2;
 }
 
-uint16_t pack_short(char *buffer, uint16_t i) {
-	uint16_t n = htons(i);
-	memcpy(buffer, &n, sizeof(n));
-	return n;
+int unpack_unsigned_short(char *buffer, unsigned short *n) {
+  memcpy(n, buffer, 2);
+  *n = ntohs(*n);
+  return 2;
 }
 
-int unpack_long(char *buffer, long *n) {
-	memcpy(n, buffer, 4);
-	*n = ntohl(*n);
-	return 4;
+int unpack_signed_long(char *buffer, long *n) {
+  memcpy(n, buffer, 4);
+  *n = (int32_t) ntohl(*n);
+  return 4;
 }
 
-int unpack_short(char *buffer, short *n) {
-	memcpy(n, buffer, 2);
-	*n = ntohs(*n);
-	return 2;
+int unpack_unsigned_long(char *buffer, unsigned long *n) {
+  memcpy(n, buffer, 4);
+  *n = ntohl(*n);
+  return 4;
 }
 
-
+int unpack_char(char *buffer, char *c) {
+  *c = *buffer;
+  return 1;
+}
