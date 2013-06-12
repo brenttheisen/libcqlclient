@@ -42,14 +42,16 @@ int round_trip_request_response(cql_connection *connection, cql_frame *request, 
 int send_frame(cql_connection *connection, cql_frame *request);
 int read_frame(cql_connection *connection, cql_frame *response, char target_stream_id);
 
-void pack_char(pack_buffer *buffer, char c);
-void pack_long(pack_buffer *buffer, uint32_t i);
-void pack_short(pack_buffer *buffer, uint16_t i);
-void pack_string_map(pack_buffer *buffer, cql_string_map *map, unsigned short element_count);
-void pack_string_common(pack_buffer *buffer, char *in, char long_string);
+unsigned long pack_char(pack_buffer *buffer, char c);
+unsigned long pack_signed_short(pack_buffer *buffer, int i);
+unsigned long pack_unsigned_short(pack_buffer *buffer, unsigned int i);
+unsigned long pack_signed_long(pack_buffer *buffer, long i);
+unsigned long pack_unsigned_long(pack_buffer *buffer, unsigned long i);
+unsigned long pack_string_map(pack_buffer *buffer, cql_string_map *map, unsigned short element_count);
+unsigned long pack_string_common(pack_buffer *buffer, char *in, char long_string);
 #define pack_string(buffer, in) pack_string_common(buffer, in, 0)
-#define pack_long_string(buffer, in) pack_string_common(buffer, in, 1)
-void write_pack_buffer(pack_buffer *buffer, char *bytes, unsigned long len);
+#define pack_unsigned_long_string(buffer, in) pack_string_common(buffer, in, 1)
+unsigned long write_pack_buffer(pack_buffer *buffer, char *bytes, unsigned long len);
 
 int unpack_char(char *buffer, char *c);
 int unpack_signed_short(char *buffer, short *n);
@@ -59,7 +61,7 @@ int unpack_unsigned_long(char *buffer, unsigned long *n);
 
 int unpack_bytes_common(char *in, char **out, long *out_length, char long_bytes);
 #define unpack_bytes(in, out, out_length) unpack_bytes_common(in, out, out_length, 1)
-#define unpack_short_bytes(in, out, out_length) unpack_bytes_common(in, out, out_length, 0)
+#define unpack_unsigned_short_bytes(in, out, out_length) unpack_bytes_common(in, out, out_length, 0)
 int unpack_string_common(char *in, char **string, char long_string);
 #define unpack_string(in, out) unpack_string_common(in, out, 0)
 #define unpack_signed_long_string(in, out) unpack_string_common(in, out, 1)
@@ -227,8 +229,8 @@ int cql_connection_query(cql_connection *connection, char *query, unsigned short
 
 	pack_buffer buffer;
 	memset(&buffer, 0, sizeof(pack_buffer));
-	pack_long_string(&buffer, query);
-	pack_short(&buffer, consistency);
+	pack_unsigned_long_string(&buffer, query);
+	pack_unsigned_short(&buffer, consistency);
 	request.length = buffer.written_len;
 	request.body = buffer.data;
 
@@ -279,7 +281,7 @@ int cql_connection_prepare(cql_connection *connection, char *query, void **resul
 	request.opcode = OPCODE_PREPARE;
 	pack_buffer buffer;
 	memset(&buffer, 0, sizeof(pack_buffer));
-	pack_long_string(&buffer, query);
+	pack_unsigned_long_string(&buffer, query);
 	request.length = buffer.written_len;
 	request.body = buffer.data;
 
@@ -315,7 +317,7 @@ int cql_connection_execute(cql_prepared_statement *prepared_statement, char **va
 	pack_buffer buffer;
 	memset(&buffer, 0, sizeof(pack_buffer));
 
-	pack_short_bytes(&buffer, prepared_statement->id, prepared_statement->id_length);
+	pack_unsigned_short_bytes(&buffer, prepared_statement->id, prepared_statement->id_length);
 
 	cql_frame request;
 	request.opcode = OPCODE_EXECUTE;
@@ -762,6 +764,7 @@ int round_trip_request_response(cql_connection *connection, cql_frame *request, 
 int send_frame(cql_connection *connection, cql_frame *request) {
 	int stream_id = connection->next_stream_id++;
 
+  // TODO Write this all to a buffered stream rather than doing it yourself
 	pack_buffer buffer;
 	memset(&buffer, 0, sizeof(pack_buffer));
 
@@ -770,7 +773,7 @@ int send_frame(cql_connection *connection, cql_frame *request) {
 	pack_char(&buffer, stream_id);
 	pack_char(&buffer, request->opcode);
 
-	pack_long(&buffer, request->length);
+	pack_unsigned_long(&buffer, request->length);
 	write_pack_buffer(&buffer, request->body, request->length);
 
 	int wrote_all = write(connection->fd, buffer.data, buffer.written_len) == buffer.written_len;
@@ -844,44 +847,60 @@ int read_frame(cql_connection *connection, cql_frame *response, char target_stre
 	return response_found;
 }
 
-void pack_string_map(pack_buffer *buffer, cql_string_map *map, unsigned short element_count) {
-	pack_short(buffer, element_count);
+unsigned long pack_string_map(pack_buffer *buffer, cql_string_map *map, unsigned short element_count) {
+  unsigned buffer_len = 0;
+
+	buffer_len += pack_unsigned_short(buffer, element_count);
 
 	int i;
 	for(i = 0; i < element_count; i++) {
-		pack_string(buffer, map[i].key);
-		pack_string(buffer, map[i].value);
+		buffer_len += pack_string(buffer, map[i].key);
+		buffer_len += pack_string(buffer, map[i].value);
 	}
+
+  return buffer_len;
 }
 
-void pack_string_common(pack_buffer *buffer, char *in, char long_string) {
-	unsigned long len = strlen(in);
+unsigned long pack_string_common(pack_buffer *buffer, char *in, char long_string) {
+	unsigned long len = strlen(in), buffer_len = 0;
 	char int_size = long_string ? 4 : 2;
 
 	if(long_string)
-		pack_long(buffer, len);
+		buffer_len += pack_unsigned_long(buffer, len);
 	else
-		pack_short(buffer, (unsigned short) len);
+		buffer_len += pack_unsigned_short(buffer, (unsigned short) len);
 
 	if(len > 0)
-		write_pack_buffer(buffer, in, len);
+		buffer_len += write_pack_buffer(buffer, in, len);
+
+  return buffer_len;
 }
 
-void pack_char(pack_buffer *buffer, char c) {
-	write_pack_buffer(buffer, &c, sizeof(char));
+unsigned long pack_char(pack_buffer *buffer, char c) {
+	return write_pack_buffer(buffer, &c, sizeof(char));
 }
 
-void pack_long(pack_buffer *buffer, uint32_t i) {
-	uint32_t n = htonl(i);
-	write_pack_buffer(buffer, (char *) &n, sizeof(n));
+unsigned long pack_signed_short(pack_buffer *buffer, int i) {
+	int16_t n = (int16_t) htons(i);
+	return write_pack_buffer(buffer, &n, 2);
 }
 
-void pack_short(pack_buffer *buffer, uint16_t i) {
+unsigned long pack_unsigned_short(pack_buffer *buffer, unsigned int i) {
 	uint16_t n = htons(i);
-	write_pack_buffer(buffer, (char *) &n, sizeof(n));
+	return write_pack_buffer(buffer, &n, 2);
 }
 
-void write_pack_buffer(pack_buffer *buffer, char *bytes, unsigned long len) {
+unsigned long pack_signed_long(pack_buffer *buffer, long i) {
+	int32_t n = (int32_t) htonl(i);
+	return write_pack_buffer(buffer, &n, 4);
+}
+
+unsigned long pack_unsigned_long(pack_buffer *buffer, unsigned long i) {
+	uint32_t n = htonl(i);
+	return write_pack_buffer(buffer, &n, 4);
+}
+
+unsigned long write_pack_buffer(pack_buffer *buffer, char *bytes, unsigned long len) {
 	if(buffer->written_len + len > buffer->alloc_len) {
 		buffer->alloc_len += PACK_BUFFER_BLOCK_SIZE;
 		buffer->data = realloc(buffer->data, buffer->alloc_len);
@@ -889,6 +908,7 @@ void write_pack_buffer(pack_buffer *buffer, char *bytes, unsigned long len) {
 
 	memcpy(buffer->data + buffer->written_len, bytes, len);
 	buffer->written_len += len;
+  return len;
 }
 
 int unpack_string_common(char *in, char **out, char long_string) {
