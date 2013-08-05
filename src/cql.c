@@ -39,7 +39,7 @@ int cql_result_create(char *in, void **result);
 int perform_startup_exchange(cql_connection *connection, void **result);
 
 int round_trip_request_response(cql_connection *connection, cql_frame *request, cql_frame *response);
-int send_frame(cql_connection *connection, cql_frame *request);
+int send_frame(cql_connection *connection, cql_frame *request, void **result);
 int read_frame(cql_connection *connection, cql_frame *response, char target_stream_id);
 
 unsigned long pack_char(pack_buffer *buffer, char c);
@@ -600,6 +600,7 @@ int cql_result_create(char *in, void **res) {
 	case CQL_RESULT_KIND_SCHEMA_CHANGE:
 		{
 			cql_schema_change *sc = malloc(sizeof(cql_schema_change));
+      memset(sc, 0, sizeof(cql_schema_change));
 			in_offset += unpack_string(in_offset, &(sc->change));
 			in_offset += unpack_string(in_offset, &(sc->keyspace));
 			in_offset += unpack_string(in_offset, &(sc->table));
@@ -761,7 +762,7 @@ int round_trip_request_response(cql_connection *connection, cql_frame *request, 
 	return read_frame(connection, response, stream_id);
 }
 
-int send_frame(cql_connection *connection, cql_frame *request) {
+int send_frame(cql_connection *connection, cql_frame *request, void **result) {
 	int stream_id = connection->next_stream_id++;
 
   // TODO Write this all to a buffered stream rather than doing it yourself
@@ -776,8 +777,18 @@ int send_frame(cql_connection *connection, cql_frame *request) {
 	pack_unsigned_long(&buffer, request->length);
 	write_pack_buffer(&buffer, request->body, request->length);
 
-	int wrote_all = write(connection->fd, buffer.data, buffer.written_len) == buffer.written_len;
+	int write_res = write(connection->fd, buffer.data, buffer.written_len);
+  if(write_res == -1) {
+    return cql_client_error_create(result, "Could not send frame: %s", strerror(errno()));
+  }
+
+  int wrote_all = write_res == buffer.written_len;
 	free(buffer.data);
+
+  if(!wrote_all)
+    printf("ROUND TRIP ERROR: WROTE ALL %d != %d\n", buffer.written_len, write_res);
+  else if(!stream_id)
+    printf("ROUND TRIP ERROR: STREAM ID 0\n");
 
 	return !wrote_all ? 0 : stream_id;
 }
@@ -805,8 +816,10 @@ int read_frame(cql_connection *connection, cql_frame *response, char target_stre
 			break;
 	}
 
-	if(readres == -1)
+	if(readres == -1) {
+    printf("ROUND TRIP ERROR: READ RES was -1\n");
 		return 0;
+  }
 
   char *buffer_offset = buffer;
   int response_found = 0;
@@ -843,6 +856,9 @@ int read_frame(cql_connection *connection, cql_frame *response, char target_stre
     free(body);
 	}
 	free(buffer);
+
+  if(!response_found)
+    printf("ROUND TRIP ERROR: RESPONSE NOT FOUND\n");
 
 	return response_found;
 }
